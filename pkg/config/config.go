@@ -59,7 +59,7 @@ func LoadLegacyConfig() (*LegacyConfig, error) {
 		AI: LegacyAIConfig{
 			Provider:            getEnvWithDefault("AI_PROVIDER", "local"),
 			OllamaEndpoint:      getEnvWithDefault("OLLAMA_ENDPOINT", "http://localhost:11434"),
-			Model:               getEnvWithDefault("AI_MODEL", "codellama"),
+			Model:               getEnvWithFallback("AI_MODEL"), // Auto-detect from available models if not set
 			APIKey:              os.Getenv("AI_API_KEY"),
 			ConfidenceThreshold: 0.7,
 			SupportedDatabases:  []string{"mysql", "postgresql", "sqlite"},
@@ -89,6 +89,18 @@ func LoadLegacyConfig() (*LegacyConfig, error) {
 	return config, nil
 }
 
+// getEnvironment returns the environment setting with production as safe default
+func getEnvironment() string {
+	env := os.Getenv("APP_ENV")
+	if env == "" {
+		env = os.Getenv("ENVIRONMENT")
+	}
+	if env == "" {
+		return "production"
+	}
+	return env
+}
+
 // ConvertLegacyToNew converts legacy configuration to new format
 func ConvertLegacyToNew(legacy *LegacyConfig) *Config {
 	if legacy == nil {
@@ -111,8 +123,7 @@ func ConvertLegacyToNew(legacy *LegacyConfig) *Config {
 		Plugin: PluginConfig{
 			Name:        "atest-ext-ai",
 			Version:     "1.0.0",
-			Environment: "development",
-			LogLevel:    "info",
+			Environment: getEnvironment(),
 		},
 		AI: AIConfig{
 			DefaultService: provider,
@@ -225,9 +236,7 @@ func validateLegacyConfig(config *LegacyConfig) error {
 		if config.AI.OllamaEndpoint == "" {
 			return fmt.Errorf("ollama_endpoint is required for local provider")
 		}
-		if config.AI.Model == "" {
-			return fmt.Errorf("model is required for local provider")
-		}
+		// Model is optional for local provider - will be auto-detected from available models
 	case "openai", "claude":
 		if config.AI.APIKey == "" {
 			return fmt.Errorf("api_key is required for %s provider", config.AI.Provider)
@@ -248,4 +257,9 @@ func getEnvWithDefault(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// getEnvWithFallback returns environment variable value
+func getEnvWithFallback(key string) string {
+	return os.Getenv(key)
 }

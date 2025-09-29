@@ -18,6 +18,7 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -77,6 +78,10 @@ type Index struct {
 // GenerateOptions contains options for SQL generation
 type GenerateOptions struct {
 	DatabaseType       string            `json:"database_type"`
+	Model              string            `json:"model,omitempty"`
+	Provider           string            `json:"provider,omitempty"`    // Runtime provider override
+	APIKey             string            `json:"api_key,omitempty"`     // Runtime API key
+	Endpoint           string            `json:"endpoint,omitempty"`    // Runtime endpoint override
 	Schema             map[string]Table  `json:"schema,omitempty"`
 	Context            []string          `json:"context,omitempty"`
 	Temperature        float64           `json:"temperature,omitempty"`
@@ -208,15 +213,50 @@ func (g *SQLGenerator) Generate(ctx context.Context, naturalLanguage string, opt
 	}
 
 	// Create AI request
-	aiRequest := &GenerateRequest{
+	aiRequest := &interfaces.GenerateRequest{
 		Prompt:       prompt,
+		Model:        options.Model,
 		Temperature:  options.Temperature,
 		MaxTokens:    options.MaxTokens,
 		SystemPrompt: g.getSystemPrompt(options.DatabaseType),
 	}
 
+	// Select AI client - use runtime client if provider/API key specified, otherwise use default
+	var aiClient interfaces.AIClient = g.aiClient
+
+	// Check if we need to create a runtime client with API key
+	if options.Provider != "" && options.APIKey != "" {
+		fmt.Printf("🔑 [DEBUG] Creating runtime AI client for provider: %s\n", options.Provider)
+
+		// Create runtime client configuration
+		runtimeConfig := map[string]any{
+			"api_key": options.APIKey,
+		}
+		if options.Endpoint != "" {
+			runtimeConfig["base_url"] = options.Endpoint
+		}
+		if options.Model != "" {
+			runtimeConfig["model"] = options.Model
+		}
+
+		// Create client factory and runtime client
+		factory, factoryErr := NewDefaultClientFactory()
+		if factoryErr != nil {
+			fmt.Printf("⚠️ [DEBUG] Failed to create client factory: %v, falling back to default\n", factoryErr)
+		} else {
+			// Create runtime client using the factory
+			runtimeClient, clientErr := factory.CreateClient(options.Provider, runtimeConfig)
+			if clientErr != nil {
+				fmt.Printf("⚠️ [DEBUG] Failed to create runtime client: %v, falling back to default\n", clientErr)
+			} else {
+				aiClient = runtimeClient
+				fmt.Printf("✅ [DEBUG] Successfully created runtime AI client for %s\n", options.Provider)
+			}
+		}
+	}
+
 	// Call AI service
-	aiResponse, err := g.aiClient.Generate(ctx, aiRequest)
+	aiResponse, err := aiClient.Generate(ctx, aiRequest)
 	if err != nil {
 		return nil, fmt.Errorf("AI generation failed: %w", err)
 	}
@@ -306,18 +346,16 @@ func (g *SQLGenerator) buildPrompt(naturalLanguage string, options *GenerateOpti
 
 	// Add format requirements
 	promptBuilder.WriteString("Response Format:\n")
-	promptBuilder.WriteString("Please provide the response in the following JSON format:\n")
-	promptBuilder.WriteString("{\n")
-	promptBuilder.WriteString("  \"sql\": \"<generated SQL query>\",\n")
+	promptBuilder.WriteString("Please provide the response in the following simple format:\n")
+	promptBuilder.WriteString("sql:<generated SQL query>\n")
 	if options.IncludeExplanation {
-		promptBuilder.WriteString("  \"explanation\": \"<explanation of the query>\",\n")
+		promptBuilder.WriteString("explanation:<explanation of the query>\n")
 	}
-	promptBuilder.WriteString("  \"confidence\": <confidence score from 0.0 to 1.0>,\n")
-	promptBuilder.WriteString("  \"query_type\": \"<SELECT|INSERT|UPDATE|DELETE|CREATE|etc>\",\n")
-	promptBuilder.WriteString("  \"tables_involved\": [\"<table names>\"],\n")
-	promptBuilder.WriteString("  \"warnings\": [\"<any warnings>\"],\n")
-	promptBuilder.WriteString("  \"suggestions\": [\"<optimization suggestions>\"]\n")
-	promptBuilder.WriteString("}\n")
+	promptBuilder.WriteString("\nExample:\n")
+	promptBuilder.WriteString("sql:SELECT * FROM users WHERE age > 18;\n")
+	if options.IncludeExplanation {
+		promptBuilder.WriteString("explanation:This query selects all users older than 18 years.\n")
+	}
 
 	return promptBuilder.String(), nil
 }
@@ -335,7 +373,7 @@ Key principles:
 5. Include appropriate error handling
 6. Use standard SQL when possible, dialect-specific features only when necessary
 
-Always respond with valid JSON format as requested.`, databaseType, databaseType)
+Always respond in the exact format requested: sql:<query> explanation:<explanation>`, databaseType, databaseType)
 }
 
 // parseAIResponse parses and validates the AI response
@@ -402,14 +440,78 @@ type SQLResponse struct {
 
 // extractSQLFromResponse extracts structured SQL information from AI response
 func (g *SQLGenerator) extractSQLFromResponse(responseText string) (*SQLResponse, error) {
-	// This is a simplified implementation - in practice, you'd want more robust JSON parsing
-	// For now, we'll create a basic response structure
+	responseText = strings.TrimSpace(responseText)
 
-	// Try to find SQL query in the response
+	// DEBUG: Log the raw AI response to understand what we're getting
+	fmt.Printf("🔍 [DEBUG] Raw AI Response: %s\n", responseText)
+
+	// First try to parse the new simple format: "sql:...\nexplanation:..."
+	if strings.HasPrefix(responseText, "sql:") {
+		// Try with newline separator first
+		parts := strings.SplitN(responseText, "\nexplanation:", 2)
+		if len(parts) == 1 {
+			// Fallback to space separator for backward compatibility
+			parts = strings.SplitN(responseText, " explanation:", 2)
+		}
+
+		sql := strings.TrimSpace(strings.TrimPrefix(parts[0], "sql:"))
+
+		explanation := "Generated SQL query based on natural language input"
+		if len(parts) > 1 {
+			explanation = strings.TrimSpace(parts[1])
+		}
+
+		return &SQLResponse{
+			SQL:            sql,
+			Explanation:    explanation,
+			Confidence:     0.8,
+			QueryType:      g.detectQueryType(sql),
+			TablesInvolved: g.extractTableNames(sql),
+			Warnings:       []string{},
+			Suggestions:    []string{},
+		}, nil
+	}
+
+	// Fallback: Check if it looks like JSON (for backward compatibility)
+	if strings.HasPrefix(responseText, "{") && strings.HasSuffix(responseText, "}") {
+		var jsonResponse SQLResponse
+		if err := json.Unmarshal([]byte(responseText), &jsonResponse); err == nil {
+			// Successfully parsed JSON
+			if jsonResponse.SQL != "" {
+				// Clean up the SQL
+				sql := strings.TrimSpace(jsonResponse.SQL)
+				sql = strings.TrimPrefix(sql, "```sql")
+				sql = strings.TrimPrefix(sql, "```json")
+				sql = strings.TrimPrefix(sql, "```")
+				sql = strings.TrimSuffix(sql, "```")
+				sql = strings.TrimSpace(sql)
+
+				// Extract explanation
+				explanation := strings.TrimSpace(jsonResponse.Explanation)
+				if explanation == "" {
+					explanation = "Generated SQL query based on natural language input"
+				}
+
+				// Return a simplified SQLResponse with only SQL and explanation
+				return &SQLResponse{
+					SQL:            sql,
+					Explanation:    explanation,
+					Confidence:     0.8,
+					QueryType:      g.detectQueryType(sql),
+					TablesInvolved: g.extractTableNames(sql),
+					Warnings:       []string{},
+					Suggestions:    []string{},
+				}, nil
+			}
+		}
+	}
+
+	// If neither format worked, try to extract SQL from plain text
 	sql := strings.TrimSpace(responseText)
 
 	// Remove common prefixes and suffixes
 	sql = strings.TrimPrefix(sql, "```sql")
+	sql = strings.TrimPrefix(sql, "```json")
 	sql = strings.TrimPrefix(sql, "```")
 	sql = strings.TrimSuffix(sql, "```")
 	sql = strings.TrimSpace(sql)

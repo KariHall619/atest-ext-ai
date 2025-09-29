@@ -124,6 +124,10 @@ AI_PLUGIN_DEVELOPMENT.md
 testdata/output/
 test-results/
 .nyc_output/
+test_*.html
+test_*.go
+preview.html
+integration.test
 
 # Docker artifacts
 .dockerignore
@@ -160,3 +164,9 @@ pids/
 .vscode/tasks.json
 .vscode/launch.json
 .vscode/extensions.json
+
+# IDE Configuration files
+.claude/
+
+# Environment files  
+.env.local*

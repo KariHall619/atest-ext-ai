@@ -59,22 +59,30 @@ func NewClient(config *Config) (*Client, error) {
 
 	// Set defaults
 	if config.BaseURL == "" {
-		// Try environment variable first, then default
-		if envURL := os.Getenv("OLLAMA_BASE_URL"); envURL != "" {
+		// Try standardized environment variable first, with fallback for compatibility
+		if envURL := os.Getenv("ATEST_EXT_AI_OLLAMA_ENDPOINT"); envURL != "" {
+			config.BaseURL = envURL
+		} else if envURL := os.Getenv("OLLAMA_ENDPOINT"); envURL != "" {
+			config.BaseURL = envURL
+		} else if envURL := os.Getenv("OLLAMA_BASE_URL"); envURL != "" {
+			// Legacy compatibility
 			config.BaseURL = envURL
 		} else {
+			// Default to local Ollama endpoint
 			config.BaseURL = "http://localhost:11434"
 		}
 	}
 	if config.Timeout == 0 {
-		config.Timeout = 60 * time.Second
+		// Increased timeout to allow for longer AI generation times
+		// Direct Ollama calls take ~12s, but our requests were timing out at 60s
+		// This suggests there may be additional overhead in our request processing
+		config.Timeout = 180 * time.Second
 	}
 	if config.MaxTokens == 0 {
 		config.MaxTokens = 4096
 	}
-	if config.Model == "" {
-		config.Model = "llama2"
-	}
+	// Model will be auto-detected from available models at runtime
+	// Don't set a hardcoded default - respect user's local models only
 	if config.UserAgent == "" {
 		config.UserAgent = "atest-ext-ai/1.0"
 	}
@@ -119,27 +127,39 @@ func NewClient(config *Config) (*Client, error) {
 // Generate executes a generation request
 func (c *Client) Generate(ctx context.Context, req *interfaces.GenerateRequest) (*interfaces.GenerateResponse, error) {
 	start := time.Now()
+	fmt.Printf("🔥🔥🔥 [DEBUG] LOCAL CLIENT GENERATE CALLED! Time: %v\n", start)
 
 	// Build the prompt with context
+	promptStart := time.Now()
 	prompt := c.buildPrompt(req)
+	fmt.Printf("🕐 [TIMING] buildPrompt() took: %v\n", time.Since(promptStart))
 
 	// Build the Ollama request
+	modelStart := time.Now()
+	model := c.getModel(req)
+	fmt.Printf("🕐 [TIMING] getModel() took: %v, model: %s\n", time.Since(modelStart), model)
+
 	ollamaReq := &GenerateRequest{
-		Model:  c.getModel(req),
+		Model:  model,
 		Prompt: prompt,
-		Stream: req.Stream,
+		Stream: false, // Force non-streaming for now to fix JSON parsing
 		Options: map[string]any{
 			"temperature": c.getTemperature(req),
 			"num_predict": c.getMaxTokens(req),
 		},
 	}
 
+	// Debug log removed - working correctly
+
 	if req.Stream {
 		return c.generateStream(ctx, ollamaReq, start)
 	}
 
 	// Make the HTTP request for non-streaming
+	requestStart := time.Now()
+	fmt.Printf("🕐 [TIMING] makeRequest() starting at: %v\n", requestStart)
 	response, err := c.makeRequest(ctx, "/api/generate", ollamaReq)
+	fmt.Printf("🕐 [TIMING] makeRequest() took: %v\n", time.Since(requestStart))
 	if err != nil {
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
@@ -165,6 +185,9 @@ func (c *Client) Generate(ctx context.Context, req *interfaces.GenerateRequest) 
 			"streaming":            false,
 		},
 	}
+
+	totalTime := time.Since(start)
+	fmt.Printf("🕐 [TIMING] Generate() completed in total: %v\n", totalTime)
 
 	return aiResponse, nil
 }
@@ -286,8 +309,7 @@ func (c *Client) generateStream(ctx context.Context, ollamaReq *GenerateRequest,
 
 	// Check for errors
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
 	// Read streaming response
@@ -370,9 +392,23 @@ func (c *Client) buildPrompt(req *interfaces.GenerateRequest) string {
 
 // getModel returns the model to use for the request
 func (c *Client) getModel(req *interfaces.GenerateRequest) string {
+	// CRITICAL FIX: Always prioritize request-specific model over auto-discovery
 	if req.Model != "" {
+		fmt.Printf("🎯 [DEBUG] Using request-specific model: '%s'\n", req.Model)
 		return req.Model
 	}
+
+	// If config model is not set, auto-detect from available models
+	if c.config.Model == "" {
+		if availableModel := c.getFirstAvailableModel(); availableModel != "" {
+			fmt.Printf("🎯 [DEBUG] Auto-detected model: '%s'\n", availableModel)
+			// DON'T cache to config.Model - let each request use its own model preference
+			return availableModel
+		}
+		// If auto-detection fails, this will cause an error in Ollama which is appropriate
+	}
+
+	fmt.Printf("🎯 [DEBUG] Using config model: '%s'\n", c.config.Model)
 	return c.config.Model
 }
 
@@ -390,6 +426,20 @@ func (c *Client) getTemperature(req *interfaces.GenerateRequest) float64 {
 		return req.Temperature
 	}
 	return c.config.Temperature
+}
+
+// getFirstAvailableModel gets the first available model for auto-detection
+func (c *Client) getFirstAvailableModel() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	models, err := c.getAvailableModels(ctx)
+	if err != nil || len(models) == 0 {
+		return ""
+	}
+
+	// Return the first available model
+	return models[0].ID
 }
 
 // getAvailableModels retrieves the list of available models from Ollama
@@ -473,16 +523,62 @@ func (c *Client) makeRequest(ctx context.Context, endpoint string, body interfac
 
 	// Check for errors
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
-	// Parse response
-	var generateResp GenerateResponse
-	if err := json.Unmarshal(respBody, &generateResp); err != nil {
+	// Response body parsing
+
+	// Handle the case where Ollama returns streaming format even when stream=false
+	// The response may contain multiple JSON objects, one per line
+	generateResp, err := c.parseOllamaResponse(respBody)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	return &generateResp, nil
+}
+
+// parseOllamaResponse parses either a single JSON response or streaming JSON responses
+func (c *Client) parseOllamaResponse(respBody []byte) (GenerateResponse, error) {
+	respStr := string(respBody)
+
+	// Try to parse as single JSON first
+	var singleResp GenerateResponse
+	if err := json.Unmarshal(respBody, &singleResp); err == nil {
+		return singleResp, nil
+	}
+
+	// If single JSON parsing fails, try to parse as streaming response
+	lines := strings.Split(strings.TrimSpace(respStr), "\n")
+
+	var finalResp GenerateResponse
+	var responseText strings.Builder
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var streamResp GenerateResponse
+		if err := json.Unmarshal([]byte(line), &streamResp); err != nil {
+			continue // Skip malformed lines
+		}
+
+		responseText.WriteString(streamResp.Response)
+		finalResp = streamResp // Keep updating with latest metadata
+
+		if streamResp.Done {
+			break
+		}
+	}
+
+	// Set the combined response text
+	finalResp.Response = responseText.String()
+
+	// Successfully parsed streaming response
+
+	return finalResp, nil
 }
 
 // Ollama API structures

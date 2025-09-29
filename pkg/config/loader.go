@@ -224,7 +224,7 @@ func (l *Loader) setupEnvironmentVariables() {
 	// Replace dots and hyphens with underscores for environment variables
 	l.viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 
-	// Bind specific environment variables
+	// Bind specific environment variables with consistent ATEST_EXT_AI_ prefix
 	envBindings := map[string]string{
 		"server.host":                 "SERVER_HOST",
 		"server.port":                 "SERVER_PORT",
@@ -232,10 +232,10 @@ func (l *Loader) setupEnvironmentVariables() {
 		"plugin.debug":                "DEBUG",
 		"plugin.log_level":            "LOG_LEVEL",
 		"plugin.environment":          "ENVIRONMENT",
-		"ai.default_service":          "AI_DEFAULT_SERVICE",
+		"ai.default_service":          "AI_PROVIDER",
 		"ai.timeout":                  "AI_TIMEOUT",
 		"ai.services.ollama.endpoint": "OLLAMA_ENDPOINT",
-		"ai.services.ollama.model":    "OLLAMA_MODEL",
+		"ai.services.ollama.model":    "AI_MODEL",
 		"ai.services.openai.api_key":  "OPENAI_API_KEY",
 		"ai.services.openai.model":    "OPENAI_MODEL",
 		"ai.services.claude.api_key":  "CLAUDE_API_KEY",
@@ -243,7 +243,6 @@ func (l *Loader) setupEnvironmentVariables() {
 		"database.enabled":            "DATABASE_ENABLED",
 		"database.driver":             "DATABASE_DRIVER",
 		"database.dsn":                "DATABASE_DSN",
-		"logging.level":               "LOG_LEVEL",
 		"logging.format":              "LOG_FORMAT",
 		"logging.output":              "LOG_OUTPUT",
 	}
@@ -418,7 +417,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("plugin.version", "1.0.0")
 	v.SetDefault("plugin.debug", false)
 	v.SetDefault("plugin.log_level", "info")
-	v.SetDefault("plugin.environment", "development")
+	v.SetDefault("plugin.environment", "production")
 
 	// AI defaults
 	v.SetDefault("ai.default_service", "ollama")
@@ -455,8 +454,8 @@ func setDefaults(v *viper.Viper) {
 	// AI Service defaults - Ollama
 	v.SetDefault("ai.services.ollama.enabled", true)
 	v.SetDefault("ai.services.ollama.provider", "ollama")
-	v.SetDefault("ai.services.ollama.endpoint", "http://localhost:11434")
-	v.SetDefault("ai.services.ollama.model", "codellama")
+	// ai.services.ollama.endpoint must be set via OLLAMA_ENDPOINT environment variable
+	// AI_MODEL will be auto-detected from available models at runtime
 	v.SetDefault("ai.services.ollama.max_tokens", 4096)
 	v.SetDefault("ai.services.ollama.temperature", 0.7)
 	v.SetDefault("ai.services.ollama.priority", 1)
@@ -468,6 +467,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("database.enabled", false)
 	v.SetDefault("database.driver", "sqlite")
 	v.SetDefault("database.dsn", "file:atest-ext-ai.db?cache=shared&mode=rwc")
+	v.SetDefault("database.default_type", "mysql")
 	v.SetDefault("database.max_connections", 10)
 	v.SetDefault("database.max_idle", 5)
 	v.SetDefault("database.max_lifetime", "1h")

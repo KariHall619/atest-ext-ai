@@ -60,10 +60,14 @@ func NewClient(config *Config) (*Client, error) {
 
 	// Set API key from environment if not provided
 	if config.APIKey == "" {
-		if envKey := os.Getenv("ANTHROPIC_API_KEY"); envKey != "" {
+		// Try standardized environment variable first, with fallback for compatibility
+		if envKey := os.Getenv("ATEST_EXT_AI_CLAUDE_API_KEY"); envKey != "" {
+			config.APIKey = envKey
+		} else if envKey := os.Getenv("ANTHROPIC_API_KEY"); envKey != "" {
+			// Legacy compatibility
 			config.APIKey = envKey
 		} else {
-			return nil, fmt.Errorf("API key is required (set ANTHROPIC_API_KEY environment variable or provide in config)")
+			return nil, fmt.Errorf("API key is required (set ATEST_EXT_AI_CLAUDE_API_KEY or ANTHROPIC_API_KEY environment variable or provide in config)")
 		}
 	}
 
@@ -342,7 +346,7 @@ func (c *Client) generateStream(ctx context.Context, claudeReq *MessagesRequest,
 		if err := json.Unmarshal(respBody, &errorResp); err == nil {
 			return nil, fmt.Errorf("API error: %s", errorResp.Error.Message)
 		}
-		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
 	// Read streaming response
@@ -475,7 +479,7 @@ func (c *Client) makeRequest(ctx context.Context, endpoint string, body interfac
 		if err := json.Unmarshal(respBody, &errorResp); err == nil {
 			return nil, fmt.Errorf("API error: %s", errorResp.Error.Message)
 		}
-		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
 	// Parse response
